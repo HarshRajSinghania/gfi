@@ -1,1 +1,406 @@
-dummy for now
+'''Core search functionality for gfi — GitHub issue finder.'''
+from __future__ import annotations
+
+import json
+import subprocess
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+
+from rich.console import Console
+
+# Human-facing notices go to stderr whenever stdout carries a machine-readable
+# payload, so a piped consumer never sees them.
+err_console = Console(stderr=True)
+
+
+def _safe_repo_path(repo: str) -> str:
+    """Build the ``owner/repo`` path for a `gh api repos/:owner/:repo` endpoint.
+
+    Each segment is percent-encoded individually so the separating ``/``
+    survives.  Encoding the whole string at once turns that ``/`` into
+    ``%2F``, producing ``repos/owner%2Frepo``, which GitHub answers with 404.
+    This is a path, not a query value, so ``safe=""`` is exactly wrong for it.
+
+    Reported by @Jah-yee in #80.
+    """
+    return "/".join(quote(seg, safe="") for seg in repo.split("/"))
+
+
+def search_qualifier(name: str, value: str) -> str:
+    """Build a single ``name:value`` search qualifier.
+
+    The value is deliberately NOT quoted here. Every search term already reaches
+    ``gh search issues`` as its own argv element, and gh quotes and escapes those
+    terms itself when it composes the REST ``q=`` parameter. Escaping here as
+    well double-quoted the value: under ``GH_DEBUG=api`` GitHub received the
+    literal ``\\"good first issue\\"``, which matches no real label, so every
+    search returned zero results while still exiting 0 (#82).
+    """
+    return f"{name}:{value}"
+
+
+@dataclass
+class Issue:
+    """A GitHub issue with relevant metadata."""
+    number: int
+    title: str
+    repo: str
+    url: str
+    state: str
+    labels: list[str] = field(default_factory=list)
+    assignees: list[str] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+    body: str = ""
+    language: str = ""
+    stars: int = 0
+    comments: int = 0
+
+    @property
+    def is_assigned(self) -> bool:
+        return len(self.assignees) > 0
+
+    def age_days(self) -> int | None:
+        if not self.created_at:
+            return None
+        try:
+            created = datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
+            return (datetime.now(created.tzinfo) - created).days
+        except ValueError:
+            return None
+
+
+class GitHubSearcher:
+    """Search GitHub for issues using the gh CLI."""
+
+    def __init__(self, cache_dir: Path | None = None):
+        self.cache_dir = cache_dir or Path.home() / ".cache" / "gfi"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.seen_file = self.cache_dir / "seen.json"
+        self.seen: set[str] = self._load_seen()
+
+    def _load_seen(self) -> set[str]:
+        if self.seen_file.exists():
+            try:
+                return set(json.loads(self.seen_file.read_text()))
+            except (json.JSONDecodeError, OSError):
+                return set()
+        return set()
+
+    def _save_seen(self) -> None:
+        try:
+            self.seen_file.write_text(json.dumps(sorted(self.seen)))
+        except OSError:
+            pass
+
+    def mark_seen(self, issue: Issue) -> None:
+        self.seen.add(f"{issue.repo}#{issue.number}")
+        self._save_seen()
+
+    def is_seen(self, issue: Issue) -> bool:
+        return f"{issue.repo}#{issue.number}" in self.seen
+
+    def reset_seen(self) -> None:
+        self.seen.clear()
+        self._save_seen()
+
+    def _get_stars(self, repo: str) -> int:
+        """Get star count for a repo."""
+        cmd = [
+            "gh", "api", f"repos/{_safe_repo_path(repo)}",
+            "--jq", ".stargazers_count",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=10
+            )
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+        except (ValueError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return 0
+
+    def _get_language(self, repo: str) -> str:
+        """Get primary language for a repo."""
+        cmd = ["gh", "api", f"repos/{_safe_repo_path(repo)}", "--jq", ".language"]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=10
+            )
+            if result.returncode == 0:
+                lang = result.stdout.strip().strip('"')
+                return lang
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return ""
+
+    def _get_repo_push_date(self, repo: str) -> datetime | None:
+        """Get last push date for a repo."""
+        cmd = ["gh", "api", f"repos/{_safe_repo_path(repo)}", "--jq", ".pushed_at"]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=10
+            )
+            if result.returncode == 0:
+                pushed_str = result.stdout.strip().strip('"')
+                if pushed_str:
+                    return datetime.fromisoformat(pushed_str.replace("Z", "+00:00"))
+        except (ValueError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return None
+
+    def search(
+        self,
+        query: str = "good first issue",
+        label: str = "good first issue",
+        state: str = "open",
+        language: str | None = None,
+        stars_min: int | None = None,
+        unassigned_only: bool = True,
+        created_after: str | None = None,
+        max_age_days: int | None = None,
+        repo_max_age_days: int | None = None,
+        repos: list[str] | None = None,
+        limit: int = 20,
+    ) -> Iterator[Issue]:
+        """Search for issues matching the criteria."""
+        if repos:
+            for repo in repos:
+                yield from self._search_repo(
+                    repo, query, label, state, language,
+                    stars_min, unassigned_only, created_after,
+                    max_age_days=max_age_days,
+                    repo_max_age_days=repo_max_age_days,
+                    limit=limit,
+                )
+        else:
+            yield from self._search_global(
+                query, label, state, language,
+                stars_min, unassigned_only, created_after,
+                max_age_days=max_age_days,
+                repo_max_age_days=repo_max_age_days,
+                limit=limit,
+            )
+
+    def _search_repo(
+        self,
+        repo: str,
+        query: str,
+        label: str,
+        state: str,
+        language: str | None,
+        stars_min: int | None,
+        unassigned_only: bool,
+        created_after: str | None,
+        *,
+        max_age_days: int | None = None,
+        repo_max_age_days: int | None = None,
+        limit: int = 20,
+    ) -> Iterator[Issue]:
+        """Search within a specific repo."""
+        # First check stars threshold
+        stars = self._get_stars(repo)
+        if stars_min and stars < stars_min:
+            return
+
+        # Cache repo metadata — language and push date are constant per repo.
+        # Previously these were looked up inside the per-issue loop, producing
+        # N identical API calls for N issues (#109).
+        repo_language = self._get_language(repo)
+        if language and repo_language.casefold() != language.casefold():
+            return
+
+        repo_push_date = None
+        if repo_max_age_days is not None:
+            repo_push_date = self._get_repo_push_date(repo)
+
+        # Build search query - quote label/user values so spaces and quotes
+        # inside them are treated as data rather than query syntax.
+        search_query_parts = [
+            query,
+            f"repo:{repo}",
+            "is:issue",
+            search_qualifier("label", label),
+            f"state:{state}",
+        ]
+        if created_after:
+            search_query_parts.append(f"created:>={created_after}")
+
+        # gh search needs each term as separate arg, not a single string
+        if limit > 1000:
+            err_console.print(
+                f"[yellow]Warning: --limit {limit} exceeds the 1000-result "
+                f"ceiling for gh search; clamping to 1000.[/yellow]"
+            )
+        cmd = [
+            "gh", "search", "issues",
+            *[t for t in search_query_parts if t.strip()],
+            "--json",
+            "number,title,url,state,labels,assignees,"
+            "createdAt,updatedAt,body,commentsCount",
+            "--limit", str(min(limit, 1000)),
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=30
+            )
+            if result.returncode != 0:
+                return
+            if result.stdout is None:
+                return
+            items = json.loads(result.stdout)
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+            return
+
+        for item in items:
+            issue = Issue(
+                number=item.get("number", 0),
+                title=item.get("title", ""),
+                repo=repo,
+                url=item.get("url", ""),
+                state=item.get("state", ""),
+                labels=[
+                    label.get("name", "") for label in item.get("labels", [])
+                ],
+                assignees=[a.get("login", "") for a in item.get("assignees", [])],
+                created_at=item.get("createdAt", ""),
+                updated_at=item.get("updatedAt", ""),
+                body=(item.get("body") or "")[:500],
+                language=repo_language,
+                stars=stars,
+                comments=item.get("commentsCount", 0),
+            )
+
+            if unassigned_only and issue.is_assigned:
+                continue
+
+            # Filter by max issue age
+            if max_age_days is not None:
+                age = issue.age_days()
+                if age is not None and age > max_age_days:
+                    continue
+
+            # Filter by repo activity
+            if repo_max_age_days is not None and repo_push_date is not None:
+                days_since_push = (
+                    datetime.now(repo_push_date.tzinfo) - repo_push_date
+                ).days
+                if days_since_push > repo_max_age_days:
+                    continue
+
+            yield issue
+
+    def _search_global(
+        self,
+        query: str,
+        label: str,
+        state: str,
+        language: str | None,
+        stars_min: int | None,
+        unassigned_only: bool,
+        created_after: str | None,
+        *,
+        max_age_days: int | None = None,
+        repo_max_age_days: int | None = None,
+        limit: int = 20,
+    ) -> Iterator[Issue]:
+        """Search globally across GitHub."""
+        # Build search query - quote label/language so spaces and quotes inside
+        # them are treated as data rather than query syntax.
+        search_terms = [
+            query,
+            "is:issue",
+            search_qualifier("label", label),
+            f"state:{state}",
+        ]
+        if unassigned_only:
+            search_terms.append("no:assignee")
+        if language:
+            search_terms.append(search_qualifier("language", language))
+        if created_after:
+            search_terms.append(f"created:>={created_after}")
+
+        # gh search needs each term as separate arg, not a single string
+        if limit > 1000:
+            err_console.print(
+                f"[yellow]Warning: --limit {limit} exceeds the 1000-result "
+                f"ceiling for gh search; clamping to 1000.[/yellow]"
+            )
+        cmd = [
+            "gh", "search", "issues",
+            *[t for t in search_terms if t.strip()],
+            "--json",
+            "number,title,repository,url,state,labels,assignees,"
+            "createdAt,updatedAt,body,commentsCount",
+            "--sort", "updated",
+            "--limit", str(min(limit, 1000)),
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=30
+            )
+            if result.returncode != 0:
+                return
+            if result.stdout is None:
+                return
+            items = json.loads(result.stdout)
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+            return
+
+        for item in items:
+            repo = item.get("repository", {}).get("nameWithOwner", "")
+            stars = self._get_stars(repo) if repo else 0
+
+            if stars_min and stars < stars_min:
+                continue
+
+            repo_lang = self._get_language(repo) if repo else ""
+            if language and repo_lang.casefold() != language.casefold():
+                continue
+
+            issue = Issue(
+                number=item.get("number", 0),
+                title=item.get("title", ""),
+                repo=repo,
+                url=item.get("url", ""),
+                state=item.get("state", ""),
+                labels=[
+                    label.get("name", "") for label in item.get("labels", [])
+                ],
+                assignees=[a.get("login", "") for a in item.get("assignees", [])],
+                created_at=item.get("createdAt", ""),
+                updated_at=item.get("updatedAt", ""),
+                body=(item.get("body") or "")[:500],
+                language=repo_lang,
+                stars=stars,
+                comments=item.get("commentsCount", 0),
+            )
+
+            if unassigned_only and issue.is_assigned:
+                continue
+
+            # Filter by max issue age
+            if max_age_days is not None:
+                age = issue.age_days()
+                if age is not None and age > max_age_days:
+                    continue
+
+            # Filter by repo activity
+            if repo_max_age_days is not None:
+                push_date = self._get_repo_push_date(repo)
+                if push_date is not None:
+                    days_since_push = (datetime.now(push_date.tzinfo) - push_date).days
+                    if days_since_push > repo_max_age_days:
+                        continue
+
+            yield issue
+
+    def trending(self, limit: int = 20) -> Iterator[Issue]:
+        """Get trending good first issues from popular repos."""
+        # This is a simplified version; real trending would use more sophisticated logic
+        return self.search(limit=limit)
